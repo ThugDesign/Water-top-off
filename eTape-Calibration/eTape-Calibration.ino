@@ -16,7 +16,11 @@
 #define CALIBRATION_RESISTANCE    732.00    // Resistance value (in ohms) when liquid is at max line.
 #define CALIBRATION_DEPTH        25.3    // Depth (in any units) when liquid is at max line.
 
+//etape bounces alot, this number determines how many times the resistance is checked and then averages those readings to get a more consistent level reading.
+
 const int levelAverageNum = 250; // how many readings of the water level are being averaged
+
+
 /* This number is very important. the eTape doesn't start reacting below 1". 
  *  whatever emasurement you decide to use cm, in, mm....etc. I would recomend CM 
  *  as that's what the application is written for. this vaule must be the equivilent to 1"
@@ -50,6 +54,7 @@ float readResistance(int pin, int seriesResistance) {
 
   // Get ADC value.
   float resistance = levelSum / levelAverageNum;
+  
   // Convert ADC reading to resistance.
   resistance = (1023.0 / resistance) - 1.0;
   resistance = round(SERIES_RESISTOR / resistance);
