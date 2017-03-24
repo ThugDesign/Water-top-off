@@ -25,7 +25,7 @@
 
 bool isFirstConnect = true;
 
-char auth[] = "authcode";
+char auth[] = "AUTHCODE";
 
 
 //Includes
@@ -39,6 +39,9 @@ char auth[] = "authcode";
 #include <SPI.h>
 #include <WiFi101.h>
 #include <BlynkSimpleWiFiShield101.h>
+#include <WidgetRTC.h>
+#include <TimeLib.h>
+#include <time.h>
 
 // Your WiFi credentials.
 // Set password to "" for open networks.
@@ -74,14 +77,16 @@ BLEPeripheral  blePeripheral;
 #define levelPin A0
 
 //Water Level Source Sensors
-#define lowPin 2 
-#define fullPin 9
+#define lowPin 9
+#define fullPin 2
 
 //Status hardware
 #define buzzerPin 15 //Digital pins 15 is A1 on the 101
 //#define errorLedPin 13
 
 //Virtual Pins
+
+WidgetRTC rtc;
 
 //Status
 #define currentLevelPin V3
@@ -122,7 +127,7 @@ float waterLevelCurrent = 0;
 float waterLevelLast = 0;
 
 
-const int levelAverageNum = 100; // how many readings of the water level are being averaged
+const int levelAverageNum = 250; // how many readings of the water level are being averaged
 const unsigned int waterLevelCheckFrequency = 2000; // how often simpleTimer runs to get the level
 
 //Gauge Property changes
@@ -131,14 +136,15 @@ String triggerGaugeColor;
 //Water Sensor Calibration
   #define SERIES_RESISTOR     2000
 
-// The following are calibration values you can fill in to compute the depth of measured liquid.
-// To find these values first start with no liquid present and record the resistance as the
-// ZERO_DEPTH_RESISTANCE value.  Next fill the container with a known depth of liquid and record
-// the sensor resistance (in ohms) as the CALIBRATION_RESISTANCE value, and the depth (which you've
-// measured ahead of time) as CALIBRATION_DEPTH.
+/* The following are calibration values you can fill in to compute the depth of measured liquid.
+* To find these values first start with no liquid present and record the resistance as the
+* ZERO_DEPTH_RESISTANCE value.  Next fill the container with a known depth of liquid and record
+* the sensor resistance (in ohms) as the CALIBRATION_RESISTANCE value, and the depth (which you've
+* measured ahead of time) as CALIBRATION_DEPTH.
+*/
   #define ZERO_DEPTH_RESISTANCE   2047.00    // Resistance value (in ohms) when no liquid is present.
-  #define CALIBRATION_RESISTANCE    732.00    // Resistance value (in ohms) when liquid is at max line.
-  #define CALIBRATION_DEPTH        25.3    // Depth (in any units) when liquid is at max line.
+  #define CALIBRATION_RESISTANCE    732.00    // Resistance value (in ohms) when liquid is at the CALIBRATION_DEPTH.
+  #define CALIBRATION_DEPTH        25.3    // Depth (in any units) of liquid as measured by the eTape. I would recommend submerging at least half the eTape but theoretically any depth should work.
 
 #define MAX_DEPTH 31.00 //max value of your eTape in CM
 #define DISPLAY_SCALE 310.00 //scale of the sliders for choosing depth settings
@@ -155,11 +161,11 @@ int lowState = 0;
 //flowrate Variable
 const int variometerNum = 6; // Number of water level checks to use to calculate if waterlevel is rising or falling
 float variometerArr[variometerNum] = {0,0,0,0,0,0};
-bool variometer;
-int variometerCheckTime = 5000;
+float variometer;
+const unsigned int variometerCheckTime = 12000;
 int variometerCount = 0;
 unsigned long sinceStart;
-const int variometerDelay = variometerNum * variometerCheckTime;
+unsigned const long variometerDelay = variometerNum * variometerCheckTime;
 
 
 ///BLYNK COLORS
@@ -211,6 +217,12 @@ int oldStatus = 5;
 int oldStatusPush = 5;
 bool inError = false;
 
+//table row id counter
+int id = 0;
+
+//how often the main status function runs to check and change state.
+const unsigned int statusCheckDelay= 500;
+
 bool errorAlert = true;
 bool fillNotice = true;
 bool waterLevelNotice = true;
@@ -226,8 +238,11 @@ void setup() {
   //Simple timer setup
   timer.setInterval(waterLevelCheckFrequency, getCurrentWaterLevel);
   timer.setInterval(notificationFrequency, pushNotification);
-  timer.setInterval(500, checkStatus);
+  timer.setInterval(statusCheckDelay, checkStatus);
   timer.setInterval(variometerCheckTime, variometerCheck);
+
+  //Interupts
+  attachInterrupt(lowPin, lowWaterNotify, FALLING);
 
   //pinmode Setup
   pinMode(buzzerPin, OUTPUT);
@@ -239,7 +254,7 @@ void setup() {
   pinMode(lowPin, INPUT_PULLUP);
   pinMode(fullPin, INPUT_PULLUP);
   
-#ifdef BLYNK_BLE
+  #ifdef BLYNK_BLE
   blePeripheral.setLocalName("Water");
   blePeripheral.setDeviceName("Water");
   blePeripheral.setAppearance(384);
@@ -247,16 +262,16 @@ void setup() {
   Blynk.begin(blePeripheral, auth);
 
   blePeripheral.begin();
-#ifdef SERIALDEBUG  
+  #ifdef SERIALDEBUG  
   Serial.println("Waiting for connections...");
-#endif
-#endif
+  #endif
+  #endif
 
-#ifdef SERIALDEBUG  
+  #ifdef SERIALDEBUG  
   Serial.begin(9600);
-#endif
+  #endif
 
-#ifdef BLYNK_WIFI
+  #ifdef BLYNK_WIFI
   /*while (!Serial) {
     ; // wait for serial port to connect. Needed for native USB port only
     }*/
@@ -277,7 +292,13 @@ void setup() {
   Serial.print("You're connected to the network");
   #endif
   printCurrentNet();
-#endif
+  #endif
+
+  //Start rtc
+  rtc.begin();
+
+  //clean table at start
+  Blynk.virtualWrite(notificationHistoryPin, "clr");
 
 }
 /*====================================================
@@ -320,7 +341,7 @@ BLYNK_WRITE(powerPin) {
   #endif
 }
 
-//Desired Fill LEVEL SET
+//max Fill LEVEL SET
 BLYNK_WRITE(setDesiredFillPin) {
   desiredFillLevel = scaleToMeasurement(param.asInt());
   #ifdef SERIALDEBUG
@@ -334,10 +355,10 @@ BLYNK_WRITE(setDesiredFillPin) {
   Blynk.virtualWrite(getDesiredFillPin, desiredFillLevel);
 
   updateControlColors();
-  //checkSettings();
+  checkSettings();
 }
 
-//Trigger point LEVEL SET
+//minimum fill LEVEL SET
 BLYNK_WRITE(setTriggerPointPin) {
   triggerPointLevel = scaleToMeasurement(param.asInt());
   #ifdef SERIALDEBUG
@@ -350,7 +371,7 @@ BLYNK_WRITE(setTriggerPointPin) {
   Blynk.virtualWrite(triggerPointPin, triggerPointLevel);
 
   updateControlColors();
-  //checkSettings();
+  checkSettings();
 }
 
 //ENABLED/DISABLED Error Alert
@@ -406,7 +427,10 @@ BLYNK_WRITE(lowWaterAlertPin) {
       lcd.clear(); //Use it to clear the LCD Widget
       lcd.print(0, 0, statusArr[currentStatus][STATUS_INFO_TOP]); // use: (position X: 0-15, position Y: 0-1, "Message you want to print")
       lcd.print(0, 1, statusArr[currentStatus][STATUS_INFO_BOTTOM]);
+
+      writeNotificationHistory(currentStatus);
     }
+
   }
 
   BLYNK_READ(sourceLevelPin){
@@ -418,7 +442,7 @@ BLYNK_WRITE(lowWaterAlertPin) {
     Serial.print("lowState: ");
     Serial.println(lowState);
     #endif
-    Blynk.virtualWrite(sourceLevelPin, 2 - (fullState + lowState));
+    Blynk.virtualWrite(sourceLevelPin, fullState + lowState);
   }
 
 ///////////// CUSTOM FUNCTIONS /////////////
@@ -426,13 +450,13 @@ void updatePump() {
   if (pumpReverse && pumpPower) {
     digitalWrite(pumpControlPin1, LOW); //Reverses Pump
     digitalWrite(pumpControlPin2, HIGH);
-    analogWrite(pumpEnablePin, flowRate); //Starts Pump
+    digitalWrite(pumpEnablePin, HIGH); //Starts Pump
   } else if (pumpPower && !pumpReverse) {
     digitalWrite(pumpControlPin1, HIGH); // Sets pump to Pump Normally
     digitalWrite(pumpControlPin2, LOW);
-    analogWrite(pumpEnablePin, flowRate); //Starts Pump
+    digitalWrite(pumpEnablePin, HIGH); //Starts Pump
   } else {
-    analogWrite(pumpEnablePin, 0);
+    digitalWrite(pumpEnablePin, LOW); //stops Pump
     digitalWrite(pumpControlPin1, LOW);
     digitalWrite(pumpControlPin1, LOW);
   }
@@ -441,9 +465,8 @@ void updatePump() {
 void checkStatus() {
 
     if(inError){
-     powerStatus = false;
-     pumpPower = false;
-     Blynk.virtualWrite(powerPin, powerStatus);
+      pumpPower = false;
+        
     }else if (!powerStatus && currentStatus != 1) {
       pumpPower = false;
       setStatus(DISABLED);
@@ -457,10 +480,12 @@ void checkStatus() {
                       pumpPower = true;
                       pumpReverse = false;
                       setStatus(PUMPING); //filling
+                      sinceStart = millis();
                     }else if (waterLevelCurrent > desiredFillLevel + upperLimit) {
                       pumpPower = true; //turn on pumping
                       pumpReverse = true; //reverse pump direction
                       setStatus(REVERSE_PUMPING); //evacuating
+                      sinceStart = millis();
                     }
                       break;
                   }
@@ -473,8 +498,8 @@ void checkStatus() {
                       pumpReverse = false;
                       setStatus(MONITORING); //monitoring
                     }
-                    sinceStart = millis();
-
+                    if(fullState)
+                      setStatus(ERROR_SOURCE_FULL);
                     break;
                   }
         case PUMPING : {
@@ -482,7 +507,6 @@ void checkStatus() {
                       pumpPower = false;
                       setStatus(MONITORING); //monitoring
                     }
-                    sinceStart = millis();
                     break;
                   }
          case STARTING_UP : {
@@ -492,7 +516,8 @@ void checkStatus() {
       }
     }
     updatePump();
-    checkError();
+    checkError(); // Checks to confirm water level is rising or falling when pumping. If you're getting lots of unknow errors you can disable this but you risk . 
+    checkSettings();
 }
 
 void getCurrentWaterLevel() {
@@ -547,7 +572,7 @@ void pushNotification(){
     oldStatusPush = currentStatus;
     bool sendPush = false;
 
-    if(errorAlert && currentStatus == (REVERSE_PUMPING)){
+    if(errorAlert && inError){
       sendPush = true;
     }else if (fillNotice && currentStatus == PUMPING){
       sendPush = true;
@@ -556,19 +581,18 @@ void pushNotification(){
     }
 
     if(sendPush){
-      Blynk.notify(statusArr[currentStatus][STATUS_DESCRIPTION] + ": " + statusArr[currentStatus][STATUS_INFO_TOP] + " " + statusArr[currentStatus][STATUS_INFO_BOTTOM]);
+      sendPushNotify(currentStatus);
     }
   }
 
 }
 
 void checkSettings(){
-    if(desiredFillLevel == 0){
-      //do nothing
-    }else if (triggerPointLevel >= desiredFillLevel){
-      Blynk.virtualWrite(powerPin, false);
+    if (triggerPointLevel >= desiredFillLevel){
       setStatus(ERROR_HIGH_TRIGGER);
-    }
+    }else if (currentStatus == ERROR_HIGH_TRIGGER)
+      setStatus(DISABLED);
+
 }
 
 
@@ -580,6 +604,8 @@ void setStatus(int const status){
       inError = false;
   } else if (status >= 6 && status <= 10){
       inError = true;
+      Blynk.virtualWrite(powerPin, false);
+      powerStatus = false;
   }
 }
 
@@ -589,18 +615,31 @@ void variometerCheck(){
 
     //Adds Current Water Level to array of waterlevels
     variometerArr[variometerCount] = waterLevelCurrent;
-
+    #ifdef SERIALDEBUG
+    Serial.print("current water level:");
+    Serial.println(waterLevelCurrent);
+    #endif
     //Sums all available water level measurements
     for(int i(0); i < variometerNum; i++){
-      sum += variometerArr[i]; 
+      sum += variometerArr[i];
+      #ifdef SERIALDEBUG
+      Serial.print("array value:");
+      Serial.println(variometerArr[i]);
+      #endif
     }
 
-    //removes current water level measurement
-    sum -= variometerArr[variometerCount];
-
+    //removes current water level measurement and subtracts some extra for variance in reading
+    sum -= (variometerArr[variometerCount]);
+    #ifdef SERIALDEBUG
+    Serial.print("sum:");
+    Serial.println(sum);
+    #endif
     //gets the average water level over all previous measurements
-    sum  /= (variometerCount - 1);
-
+    sum  /= (variometerNum - 1);
+    #ifdef SERIALDEBUG
+    Serial.print("sum:");
+    Serial.println(sum);
+    #endif
     //subtract the current water level measurement again
     sum -= variometerArr[variometerCount];
 
@@ -609,33 +648,49 @@ void variometerCheck(){
     rising and thus we return true. If the number is positive we know the 
     current level is lower than the average of all previous measurements and thus is going down*/
     
-    variometer = sum > 0;
+    variometer = sum ;
 
     #ifdef SERIALDEBUG
     Serial.print("variometer:");
     Serial.println(variometer);
     #endif
 
-    if(variometerCount >= variometerNum)
+    if(variometerCount >= (variometerNum - 1))
       variometerCount = 0;
+    else
+      variometerCount++;
 }
 
 void checkError(){
-  if((millis() - sinceStart) > variometerDelay){
-    if(!variometer && currentStatus == PUMPING){
+  if(((millis() - sinceStart) > variometerDelay) & (waterLevelCurrent > 2.8)){
+    if(variometer >= 0 && currentStatus == PUMPING){
       if(!lowState)
         setStatus(ERROR_REFILL);
       else
         setStatus(ERROR_PUMPING);
-    }else if(variometer && currentStatus == REVERSE_PUMPING){
-      if(!fullState)
-        setStatus(ERROR_SOURCE_FULL);
-      else
+    }else if(variometer <= 0 && currentStatus == REVERSE_PUMPING){
         setStatus(ERROR_REV_PUMPING);
     }
   }
 }
 
+void writeNotificationHistory(const int intstatus){
+  //Write History Table
+  Blynk.virtualWrite(notificationHistoryPin, "add", id, statusArr[intstatus][STATUS_DESCRIPTION] , String(hour()) + ":" + minute() + " - " + month() + "/" + day() + "/" + (year() - 2000));
+  //highlighting latest added row in table
+  Blynk.virtualWrite(notificationHistoryPin, "pick", id);
+  id++;
+}
+
+void sendPushNotify(const int intstatus){
+  Blynk.notify(statusArr[intstatus][STATUS_DESCRIPTION] + ": " + statusArr[intstatus][STATUS_INFO_TOP] + " " + statusArr[intstatus][STATUS_INFO_BOTTOM]);
+}
+
+void lowWaterNotify(){
+  if(waterLevelNotice)
+    sendPushNotify(LOW_WATER);
+  writeNotificationHistory(LOW_WATER);
+}
 
 #if defined(BLYNK_WIFI) && defined(SERIALDEBUG)
 void printCurrentNet() {
