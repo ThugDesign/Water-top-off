@@ -6,6 +6,8 @@
 
   www.thugdesign.com
 
+  verison - 0.9.0 - BETA
+
  **************************************************************
 
    NOTE: Blynk BLE support is in beta!
